@@ -375,6 +375,7 @@ fn main() {
             ui_window: false,
             ..default()
         })
+        // Persistent shader storage, the same on native and the web.
         .insert_resource(PkvStore::new("nannou-org", "wisp"))
         .add_systems(Startup, setup)
         .add_systems(Update, apply_default_image_inputs)
