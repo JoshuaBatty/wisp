@@ -375,8 +375,6 @@ fn main() {
             ui_window: false,
             ..default()
         })
-        // Persistent shader storage, the same on native (a `redb` file in the
-        // platform data dir) and the web (browser local storage).
         .insert_resource(PkvStore::new("nannou-org", "wisp"))
         .add_systems(Startup, setup)
         .add_systems(Update, apply_default_image_inputs)
@@ -682,9 +680,6 @@ fn editor_ui(
     let wisp = handle.and_then(|handle| wisps.get(&**handle));
     let mut shader_rect = None;
     simplify_tree(&mut tree.0, ctx);
-    // The tree fills a frameless root `Ui` over the whole window, so the shader
-    // pane reveals the wisp camera and each other pane paints its own
-    // background.
     let mut root = egui::Ui::new(
         ctx.clone(),
         "wisp_editor".into(),

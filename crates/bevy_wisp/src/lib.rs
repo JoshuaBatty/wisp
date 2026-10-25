@@ -133,8 +133,6 @@ impl Plugin for WispPlugin {
         #[cfg(feature = "audio")]
         app.init_resource::<audio::WispAudio>()
             .add_systems(Update, audio::update_audio_textures.after(sync_wisp_inputs));
-        // egui's primary context pass only runs once `EguiPlugin` is added, so
-        // the panel stays inert without it.
         #[cfg(feature = "ui")]
         app.add_systems(bevy_egui::EguiPrimaryContextPass, ui::wisp_ui);
     }

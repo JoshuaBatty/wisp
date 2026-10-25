@@ -30,8 +30,7 @@ bevy_egui = { workspace = true }
 egui_extras = { version = "0.36", default-features = false }
 egui_tiles = "0.17.1"
 # Persistent shader storage, the same on native (a `redb` file in the platform
-# data dir) and the web (browser local storage). The default `bevy` feature makes
-# `PkvStore` a `Resource`.
+# data dir) and the web (browser local storage).
 bevy_pkv = "0.17"
 
 # Microphone capture for `@audio` shaders; native only (cpal's web backends do
