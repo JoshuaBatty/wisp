@@ -22,6 +22,8 @@ bevy_camera = { workspace = true }
 bevy_core_pipeline = { workspace = true }
 bevy_derive = { workspace = true }
 bevy_ecs = { workspace = true }
+# Named by the code the `ExtractComponent`/`ExtractResource` derives expand to.
+bevy_extract = { workspace = true }
 bevy_image = { workspace = true }
 bevy_input = { workspace = true }
 bevy_log = { workspace = true }
@@ -37,9 +39,9 @@ bevy_egui = { workspace = true, optional = true }
 bytemuck = "1"
 evalexpr = "13"
 half = { version = "2", optional = true }
-# Kept in lockstep with the `naga` used by `bevy_shader`, so that wisp's
-# reflection accepts exactly the WGSL that bevy compiles.
-naga = { version = "29", default-features = false, features = ["wgsl-in"] }
+# Kept in lockstep with the `naga` that bevy's `wgpu` compiles shaders with, so
+# that wisp's reflection accepts exactly the WGSL the GPU backend compiles.
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }
 rustfft = { version = "6", optional = true }
 thiserror = "2"
 
