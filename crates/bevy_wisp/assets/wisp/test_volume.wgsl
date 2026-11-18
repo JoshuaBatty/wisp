@@ -5,6 +5,7 @@
 struct Globals {
     resolution: vec2<f32>,
     time: f32,
+    time_delta: f32,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var samp: sampler;
@@ -12,8 +13,8 @@ struct Globals {
 struct Params {
     /// @min(0.0) @max(4.0) @default(1.0) Drift speed of the smoke.
     speed: f32,
-    /// @min(0.0) @max(0.995) @default(0.975) How long the smoke lingers.
-    decay: f32,
+    /// @min(0.0) @max(4.0) @default(1.5) Seconds the smoke lingers.
+    linger: f32,
     /// @min(0.0) @max(40.0) @default(8.0) Opacity of the smoke.
     density: f32,
     /// @color @default(1.0, 0.45, 0.15)
@@ -49,7 +50,8 @@ fn noise(p: vec3<f32>) -> f32 {
 }
 
 /// Bake one voxel: new smoke from three swaying columns, plus last frame's
-/// smoke moved up one voxel and faded.
+/// smoke carried up and faded. Motion and fading scale with the frame time,
+/// so the look is the same at any frame rate and volume size.
 /// @pass(target = "smoke", float, width = 128, height = 128, depth = 128)
 @compute @workgroup_size(4, 4, 4)
 fn bake(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -72,10 +74,15 @@ fn bake(@builtin(global_invocation_id) id: vec3<u32>) {
     fresh *= smoothstep(-0.7, -0.9, p.y);
     fresh *= 0.5 + noise(p * 6.0 + vec3<f32>(0.0, -t * 2.0, 0.0));
 
-    let below = vec3<i32>(id) - vec3<i32>(0, 1, 0);
-    let swirl = vec3<i32>(vec3<f32>(noise(p * 3.0 + t) - 0.5, 0.0, noise(p * 3.0 - t) - 0.5) * 2.0);
-    let previous = textureLoad(smoke, clamp(below + swirl, vec3<i32>(0), vec3<i32>(size) - 1), 0).a;
-    let d = max(fresh, previous * params.decay);
+    // Carry last frame's smoke: read it from where it was one frame ago.
+    // Trilinear filtering moves it by fractions of a voxel.
+    let dt = min(globals.time_delta, 0.1);
+    let swirl = vec3<f32>(noise(p * 3.0 + t) - 0.5, 0.0, noise(p * 3.0 - t) - 0.5);
+    let velocity = vec3<f32>(swirl.x, 1.0, swirl.z) * 0.8 * max(params.speed, 0.05);
+    let source = (p - velocity * dt) * 0.5 + 0.5;
+    let previous = textureSampleLevel(smoke, samp, source, 0.0).a;
+    let fade = exp(-dt / max(params.linger, 0.01));
+    let d = max(fresh, previous * fade);
 
     // Colour by height: hot at the floor, cooling as it rises.
     let heat = clamp(1.0 - (p.y + 1.0) * 0.5, 0.0, 1.0);
