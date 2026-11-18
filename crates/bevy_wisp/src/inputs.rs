@@ -119,7 +119,8 @@ fn default_value(field: &ParamField) -> WispValue {
     }
 }
 
-fn write_value(bytes: &mut [u8], offset: usize, value: &WispValue) {
+/// Write one value at a byte offset; images are not packed.
+pub(crate) fn write_value(bytes: &mut [u8], offset: usize, value: &WispValue) {
     let write = |bytes: &mut [u8], src: &[u8]| {
         bytes[offset..offset + src.len()].copy_from_slice(src);
     };

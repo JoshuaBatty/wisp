@@ -5,8 +5,16 @@
 //! `@group(0) @binding(0)` whose members are any subset of the recognized names
 //! below. Wisp writes each member at its reflected offset, so declaring only what a
 //! shader uses is fine.
+//!
+//! An app can declare more members with [`WispConfig::app_globals`]
+//! (a name and a type each) and set their values each frame in
+//! [`AppGlobalValues`].
+//!
+//! [`WispConfig::app_globals`]: crate::WispConfig::app_globals
 
+use crate::inputs::{WispValue, write_value};
 use crate::schema::ParamType;
+use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::prelude::*;
 use bevy_input::prelude::{ButtonInput, MouseButton};
 use bevy_math::{Vec2, Vec4};
@@ -14,6 +22,7 @@ use bevy_render::RenderApp;
 use bevy_render::extract_resource::ExtractResource;
 use bevy_time::prelude::Time;
 use bevy_window::{PrimaryWindow, Window};
+use std::collections::BTreeMap;
 
 /// A recognized member of the wisp globals uniform struct.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -36,6 +45,49 @@ pub enum GlobalKind {
     Date,
 }
 
+/// A globals member declared by the app rather than built into wisp, such as
+/// a scene size the host knows and wisp does not.
+///
+/// Wisps may declare it in their globals struct with exactly this name and
+/// type; the app sets its value in [`AppGlobalValues`].
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AppGlobal {
+    /// The member name; it must not shadow a built-in member.
+    pub name: String,
+    /// The type the member must be declared with (`f32`, `i32`, `u32`,
+    /// `vec2<f32>`, `vec3<f32>` or `vec4<f32>`).
+    pub ty: ParamType,
+}
+
+impl AppGlobal {
+    /// An app global with the given name and type.
+    pub fn new(name: impl Into<String>, ty: ParamType) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+        }
+    }
+}
+
+/// The current values of the app-declared globals, keyed by member name.
+///
+/// Extracted each frame. A member with no value here, or a value of another
+/// type, is written as zero.
+#[derive(Resource, ExtractResource, Clone, Debug, Default, Deref, DerefMut)]
+#[extract_app(RenderApp)]
+pub struct AppGlobalValues(pub BTreeMap<String, WispValue>);
+
+/// An app-declared member present in a shader's globals struct.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppGlobalField {
+    /// The member name.
+    pub name: String,
+    /// The declared type.
+    pub ty: ParamType,
+    /// Byte offset within the globals uniform.
+    pub offset: u32,
+}
+
 /// The reflected layout of a shader's globals uniform struct.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlobalsSchema {
@@ -43,6 +95,8 @@ pub struct GlobalsSchema {
     pub size: u32,
     /// The recognized members with their byte offsets.
     pub fields: Vec<(GlobalKind, u32)>,
+    /// The app-declared members the shader uses, in declaration order.
+    pub app_fields: Vec<AppGlobalField>,
 }
 
 /// The per-pass values written into a globals uniform.
@@ -139,6 +193,32 @@ pub fn pack_globals(schema: &GlobalsSchema, values: &GlobalsValues) -> Vec<u8> {
         }
     }
     bytes
+}
+
+/// Write the app-declared members' values into a buffer packed by
+/// [`pack_globals`]. Missing or mistyped values are left as zero.
+pub fn pack_app_globals(schema: &GlobalsSchema, values: &AppGlobalValues, bytes: &mut [u8]) {
+    for field in &schema.app_fields {
+        if let Some(value) = values.get(&field.name)
+            && value_has_type(value, field.ty)
+        {
+            write_value(bytes, field.offset as usize, value);
+        }
+    }
+}
+
+/// Whether a value packs as a member of the given type.
+fn value_has_type(value: &WispValue, ty: ParamType) -> bool {
+    matches!(
+        (value, ty),
+        (WispValue::F32(_), ParamType::F32)
+            | (WispValue::I32(_), ParamType::I32)
+            | (WispValue::U32(_), ParamType::U32)
+            | (WispValue::Bool(_), ParamType::Bool)
+            | (WispValue::Vec2(_), ParamType::Vec2)
+            | (WispValue::Vec3(_), ParamType::Vec3)
+            | (WispValue::Vec4(_), ParamType::Vec4)
+    )
 }
 
 /// `(year, month, day, seconds since midnight)` for the given seconds since the
@@ -241,6 +321,7 @@ mod tests {
         let schema = GlobalsSchema {
             size: 16,
             fields: vec![(GlobalKind::Time, 0), (GlobalKind::Resolution, 8)],
+            app_fields: Vec::new(),
         };
         let values = GlobalsValues {
             time: 2.0,
@@ -258,6 +339,7 @@ mod tests {
         let schema = GlobalsSchema {
             size: 8,
             fields: vec![(GlobalKind::Frame, 0), (GlobalKind::PassIndex, 4)],
+            app_fields: Vec::new(),
         };
         let values = GlobalsValues {
             frame: 7,
@@ -267,5 +349,44 @@ mod tests {
         let bytes = pack_globals(&schema, &values);
         let words: &[u32] = bytemuck::cast_slice(&bytes);
         assert_eq!(words, &[7, 2]);
+    }
+
+    #[test]
+    fn pack_app_fields() {
+        let schema = GlobalsSchema {
+            size: 32,
+            fields: vec![(GlobalKind::Time, 0)],
+            app_fields: vec![
+                AppGlobalField {
+                    name: String::from("extents"),
+                    ty: ParamType::Vec3,
+                    offset: 16,
+                },
+                AppGlobalField {
+                    name: String::from("count"),
+                    ty: ParamType::U32,
+                    offset: 4,
+                },
+            ],
+        };
+        let mut values = AppGlobalValues::default();
+        values.insert(
+            String::from("extents"),
+            WispValue::Vec3(bevy_math::Vec3::new(1.0, 2.0, 3.0)),
+        );
+        // Mistyped: stays zero.
+        values.insert(String::from("count"), WispValue::F32(9.0));
+        let mut bytes = pack_globals(
+            &schema,
+            &GlobalsValues {
+                time: 5.0,
+                ..Default::default()
+            },
+        );
+        pack_app_globals(&schema, &values, &mut bytes);
+        let floats: &[f32] = bytemuck::cast_slice(&bytes);
+        assert_eq!(floats[0], 5.0);
+        assert_eq!(floats[1].to_bits(), 0);
+        assert_eq!(&floats[4..7], &[1.0, 2.0, 3.0]);
     }
 }

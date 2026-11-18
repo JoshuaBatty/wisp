@@ -121,6 +121,18 @@ reflected offset:
 | `mouse` | `vec4<f32>` | cursor xy in pixels; z = 1 while the primary button is held; w = 1 on press |
 | `date` | `vec4<f32>` | (year, month, day, seconds since midnight), UTC |
 
+An app can declare more members with `WispConfig::app_globals`, each a name
+and a type, and set their values each frame in the `AppGlobalValues` resource.
+A wisp may then declare them like the built-in ones; a member with no value is
+zero. Unknown names are still load errors.
+
+```rust
+app.insert_resource(WispConfig {
+    app_globals: vec![AppGlobal::new("extents", ParamType::Vec3)],
+    ..default()
+});
+```
+
 ### Params
 
 Members of the params struct may be `f32`, `i32`, `u32`, `vec2<f32>`,
