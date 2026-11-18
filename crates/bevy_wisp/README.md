@@ -209,8 +209,8 @@ import shapes::circle::circle;          // a registered package
   ```
 
 Every `@if` flag is off. Declarations in the wisp's own file keep their names
-and `///` annotations; unused imported declarations are dropped. See the `wesl`
-example, which imports from both.
+and `///` annotations; imported declarations get unique hashed names, and unused
+ones are dropped. See the `wesl` example, which imports from both.
 
 ## Errors and hot reload
 

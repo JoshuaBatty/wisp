@@ -149,12 +149,8 @@ impl WispLoader {
     }
 }
 
-/// An asset's path within its source, `/`-separated on every platform.
+/// An asset's path within its source, `/`-separated on every platform. An
+/// absolute path stays absolute, so its local modules are read beside it.
 fn asset_path_string(path: &AssetPath<'_>) -> String {
-    let components: Vec<_> = path
-        .path()
-        .iter()
-        .map(|component| component.to_string_lossy())
-        .collect();
-    components.join("/")
+    path.path().to_string_lossy().replace('\\', "/")
 }

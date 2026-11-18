@@ -15,13 +15,15 @@
 //!   `import package::wisp::common::palette;`, resolve to other assets. The
 //!   module path is the asset path without its extension (`wisp/common`), read
 //!   as `wisp/common.wesl`, or `wisp/common.wgsl` if that does not exist.
+//!   `super::` is relative to the wisp's own path, which may be absolute, and
 //!   `package::` is the root of the asset source. Local modules are loader
 //!   dependencies, so editing one hot-reloads every wisp that imports it.
 //!
 //! Every `@if` feature flag is off. Declarations in the wisp's own file are
 //! never renamed or removed, and their `///` doc comments are carried into the
 //! linked WGSL, so annotations work as they do in a `.wgsl` wisp. Imported
-//! declarations are renamed to unique names, and unused ones are removed.
+//! declarations get unique hashed names (such as `palette_1234`), and unused
+//! ones are removed.
 
 pub use wesl::package::{StaticPackage, StaticPackageModule};
 
@@ -87,6 +89,31 @@ impl WeslSources {
         module
     }
 
+    /// Link like [`WeslSources::link`], reading each missing local module with
+    /// `read` until none is missing.
+    ///
+    /// `read` gets a module path (such as `wisp/common`) and returns that
+    /// module's asset path and source, or `None` if neither `<module>.wesl` nor
+    /// `<module>.wgsl` exists. This suits callers that read synchronously, such
+    /// as tools that reflect wisps from disk; the asset loader reads through the
+    /// asset server instead.
+    pub fn link_with(
+        &mut self,
+        packages: &[&'static StaticPackage],
+        mut read: impl FnMut(&str) -> Option<(String, String)>,
+    ) -> Result<String, LinkError> {
+        loop {
+            match self.link(packages) {
+                Err(LinkError::MissingModule { module, message }) => {
+                    let (path, source) =
+                        read(&module).ok_or(LinkError::MissingModule { module, message })?;
+                    self.insert(path, source);
+                }
+                linked => return linked,
+            }
+        }
+    }
+
     /// Link the wisp and everything it imports into one WGSL module, resolving
     /// package imports against `packages`.
     pub fn link(&self, packages: &[&'static StaticPackage]) -> Result<String, LinkError> {
@@ -105,6 +132,10 @@ impl WeslSources {
             keep_main: true,
             // The linked WGSL is validated by naga during reflection.
             validate: false,
+            // Imported names are made from module paths, which are asset paths
+            // and may hold characters that are not valid in WGSL names. Hashed
+            // names are always valid.
+            mangler: wesl::ManglerKind::Hash,
             ..Default::default()
         };
         let root = module_path(&self.root);
@@ -287,25 +318,17 @@ mod tests {
     use crate::reflect::parse_and_validate;
     use crate::schema::{UiHints, schema_from_module};
 
-    /// Link `sources`, adding local modules from `files` as they are reported missing.
+    /// Link `sources`, reading local modules from `files` as they are needed.
     fn link_with(
         mut sources: WeslSources,
         files: &[(&str, &str)],
         packages: &[&'static StaticPackage],
     ) -> Result<String, LinkError> {
-        loop {
-            match sources.link(packages) {
-                Err(LinkError::MissingModule { module, message }) => {
-                    let wesl = format!("{module}.wesl");
-                    let (path, source) = files
-                        .iter()
-                        .find(|(path, _)| *path == wesl)
-                        .ok_or(LinkError::MissingModule { module, message })?;
-                    sources.insert(*path, *source);
-                }
-                result => return result,
-            }
-        }
+        sources.link_with(packages, |module| {
+            let wesl = format!("{module}.wesl");
+            let (path, source) = files.iter().find(|(path, _)| *path == wesl)?;
+            Some((path.to_string(), source.to_string()))
+        })
     }
 
     const SCENE: &str = "//! A scene that tints a gradient.
@@ -373,6 +396,16 @@ fn never_used() {}
             .as_ref()
             .map(|target| target.name.as_str());
         assert_eq!(target, Some("gradient"));
+    }
+
+    /// A wisp loaded by an absolute path, with characters that are not valid in
+    /// WGSL names, still finds its local modules beside it.
+    #[test]
+    fn links_wisps_at_absolute_paths() {
+        let sources = WeslSources::new("/my shaders/Study 008/scene.wesl", SCENE);
+        let files = [("/my shaders/Study 008/lib/palette.wesl", PALETTE)];
+        let wgsl = link_with(sources, &files, &[]).unwrap();
+        parse_and_validate(&wgsl).unwrap();
     }
 
     #[test]
