@@ -15,6 +15,7 @@
 //! replacing it on hot reload recompiles dependent pipelines automatically.
 
 use crate::WispConfig;
+use crate::globals::AppGlobal;
 use crate::link::{LinkError, StaticPackage, WeslSources};
 use crate::reflect::{self, ReflectError};
 use crate::schema::{self, SchemaError, WispSchema};
@@ -44,18 +45,24 @@ pub struct Wisp {
 pub struct WispHandle(pub Handle<Wisp>);
 
 /// Loads [`Wisp`]s, linking `.wesl` ones against the packages in
-/// [`WispConfig::wesl_packages`].
+/// [`WispConfig::wesl_packages`] and accepting the globals members in
+/// [`WispConfig::app_globals`].
 #[derive(TypePath)]
 pub struct WispLoader {
     packages: Vec<&'static StaticPackage>,
+    app_globals: Vec<AppGlobal>,
 }
 
 impl FromWorld for WispLoader {
     fn from_world(world: &mut World) -> Self {
         let config = world.get_resource::<WispConfig>();
-        let packages = config.map(|config| config.wesl_packages.clone());
         Self {
-            packages: packages.unwrap_or_default(),
+            packages: config
+                .map(|config| config.wesl_packages.clone())
+                .unwrap_or_default(),
+            app_globals: config
+                .map(|config| config.app_globals.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -97,7 +104,7 @@ impl AssetLoader for WispLoader {
             source
         };
         let reflected = reflect::parse_and_validate(source)?;
-        let schema = schema::schema_from_module(&reflected)?;
+        let schema = schema::schema_from_module_with(&reflected, &self.app_globals)?;
         let path = load_context.path().to_string();
         // Pad the uniform structs to a 16-byte multiple so their types are
         // accepted on devices without `BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED`

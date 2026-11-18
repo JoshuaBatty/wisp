@@ -80,6 +80,7 @@ pub mod prelude {
     #[cfg(feature = "audio")]
     pub use crate::audio::WispAudio;
     pub use crate::error::WispErrors;
+    pub use crate::globals::{AppGlobal, AppGlobalValues};
     pub use crate::inputs::{WispInputs, WispValue};
     pub use crate::schema::WispSchema;
     pub use crate::{WispConfig, WispPlugin};
@@ -106,6 +107,11 @@ pub struct WispConfig {
     /// `import my_lib::noise::fbm;` (see [`link`]). Read once, when the plugin is
     /// added.
     pub wesl_packages: Vec<&'static link::StaticPackage>,
+    /// Globals members the app provides besides the built-in ones, such as a
+    /// scene size wisp cannot know. Wisps may declare them in their globals
+    /// struct; set their values in [`globals::AppGlobalValues`]. Read once,
+    /// when the plugin is added.
+    pub app_globals: Vec<globals::AppGlobal>,
 }
 
 impl Default for WispConfig {
@@ -114,6 +120,7 @@ impl Default for WispConfig {
             prefer_mailbox: true,
             ui_window: true,
             wesl_packages: Vec::new(),
+            app_globals: Vec::new(),
         }
     }
 }
@@ -127,6 +134,7 @@ impl Plugin for WispPlugin {
             .init_asset::<Wisp>()
             .init_asset_loader::<WispLoader>()
             .init_resource::<FrameGlobals>()
+            .init_resource::<globals::AppGlobalValues>()
             .init_resource::<WispErrors>()
             .add_plugins(render::WispRenderPlugin)
             .add_systems(

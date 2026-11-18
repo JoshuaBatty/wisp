@@ -23,7 +23,7 @@
 //!   `texture_3d<f32>` of the target's name.
 
 use crate::annot::{self, Annotation, Arg, Docs, Value};
-use crate::globals::{GlobalKind, GlobalsSchema};
+use crate::globals::{AppGlobal, AppGlobalField, GlobalKind, GlobalsSchema};
 use crate::reflect::ReflectedModule;
 use bevy_math::{UVec2, UVec3};
 use bevy_render::render_resource::{ShaderStages, TextureFormat};
@@ -419,6 +419,15 @@ impl PassStage {
 
 /// Build a [`WispSchema`] from a parsed and validated module.
 pub fn schema_from_module(reflected: &ReflectedModule) -> Result<WispSchema, SchemaError> {
+    schema_from_module_with(reflected, &[])
+}
+
+/// Build a [`WispSchema`] from a parsed and validated module, accepting the
+/// given app-declared members in the globals struct besides the built-in ones.
+pub fn schema_from_module_with(
+    reflected: &ReflectedModule,
+    app_globals: &[AppGlobal],
+) -> Result<WispSchema, SchemaError> {
     let ReflectedModule { module, info } = reflected;
     let docs = module.doc_comments.as_deref();
 
@@ -470,7 +479,14 @@ pub fn schema_from_module(reflected: &ReflectedModule) -> Result<WispSchema, Sch
                         if binding != 0 {
                             return Err(SchemaError::Group0Binding { name, binding });
                         }
-                        globals = Some(globals_schema(module, var.ty, members, span, docs)?);
+                        globals = Some(globals_schema(
+                            module,
+                            var.ty,
+                            members,
+                            span,
+                            docs,
+                            app_globals,
+                        )?);
                         BindingTy::Globals { size: span }
                     }
                     1 => {
@@ -912,20 +928,45 @@ fn globals_schema(
     members: &[naga::StructMember],
     span: u32,
     docs: Option<&DocComments>,
+    app_globals: &[AppGlobal],
 ) -> Result<GlobalsSchema, SchemaError> {
     let mut fields = Vec::new();
+    let mut app_fields = Vec::new();
     for (index, member) in members.iter().enumerate() {
         let name = member.name.clone().unwrap_or_default();
-        let valid = || GlobalKind::ALL.map(GlobalKind::name).join(", ");
-        let kind = GlobalKind::from_name(&name).ok_or_else(|| SchemaError::UnknownGlobal {
-            name: name.clone(),
-            valid: valid(),
-        })?;
-        if param_type_of(module, member.ty) != Some(kind.param_ty()) {
-            return Err(SchemaError::GlobalType {
-                name,
-                expected: kind.param_ty().wgsl_name(),
-            });
+        let declared = param_type_of(module, member.ty);
+        match GlobalKind::from_name(&name) {
+            Some(kind) => {
+                if declared != Some(kind.param_ty()) {
+                    return Err(SchemaError::GlobalType {
+                        name,
+                        expected: kind.param_ty().wgsl_name(),
+                    });
+                }
+                fields.push((kind, member.offset));
+            }
+            None => {
+                let Some(app) = app_globals.iter().find(|app| app.name == name) else {
+                    let valid = GlobalKind::ALL
+                        .map(GlobalKind::name)
+                        .into_iter()
+                        .chain(app_globals.iter().map(|app| app.name.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(SchemaError::UnknownGlobal { name, valid });
+                };
+                if declared != Some(app.ty) {
+                    return Err(SchemaError::GlobalType {
+                        name,
+                        expected: app.ty.wgsl_name(),
+                    });
+                }
+                app_fields.push(AppGlobalField {
+                    name: name.clone(),
+                    ty: app.ty,
+                    offset: member.offset,
+                });
+            }
         }
         // Annotations carry no meaning on globals members - reject them so typos
         // (e.g. a misplaced `@default`) don't pass silently.
@@ -937,9 +978,12 @@ fn globals_schema(
             })?;
             check_known(&parsed, &[], &context)?;
         }
-        fields.push((kind, member.offset));
     }
-    Ok(GlobalsSchema { size: span, fields })
+    Ok(GlobalsSchema {
+        size: span,
+        fields,
+        app_fields,
+    })
 }
 
 fn params_schema(
@@ -1504,6 +1548,46 @@ mod tests {
         assert!(matches!(
             schema_err(&wrong_ty),
             SchemaError::GlobalType { name, expected } if name == "time" && expected == "f32"
+        ));
+    }
+
+    #[test]
+    fn app_globals() {
+        let src = format!(
+            "
+            struct Globals {{
+                time: f32,
+                extents: vec3<f32>,
+            }}
+            @group(0) @binding(0) var<uniform> globals: Globals;
+            {FINAL_PASS}
+            "
+        );
+        let module = parse_and_validate(&src).unwrap();
+        // Without the declaration the member is unknown.
+        assert!(matches!(
+            schema_from_module(&module).unwrap_err(),
+            SchemaError::UnknownGlobal { name, .. } if name == "extents"
+        ));
+        let extents = [AppGlobal::new("extents", ParamType::Vec3)];
+        let globals = schema_from_module_with(&module, &extents)
+            .unwrap()
+            .globals
+            .unwrap();
+        assert_eq!(globals.fields, vec![(GlobalKind::Time, 0)]);
+        assert_eq!(
+            globals.app_fields,
+            vec![AppGlobalField {
+                name: String::from("extents"),
+                ty: ParamType::Vec3,
+                offset: 16,
+            }]
+        );
+        // The declared type must match.
+        let wrong = [AppGlobal::new("extents", ParamType::Vec4)];
+        assert!(matches!(
+            schema_from_module_with(&module, &wrong).unwrap_err(),
+            SchemaError::GlobalType { name, expected } if name == "extents" && expected == "vec4<f32>"
         ));
     }
 

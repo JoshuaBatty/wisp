@@ -8,7 +8,7 @@
 
 use crate::asset::{Wisp, WispHandle};
 use crate::error::WispErrors;
-use crate::globals::{FrameGlobals, pack_globals};
+use crate::globals::{AppGlobalValues, FrameGlobals, pack_app_globals, pack_globals};
 use crate::inputs::{WispInputs, WispValue, pack_params};
 use crate::schema::{BindingDesc, BindingTy, PassStage, TextureRole, WispSchema, requires_compute};
 use crate::targets::WispPassTargets;
@@ -144,6 +144,7 @@ impl Plugin for WispRenderPlugin {
             ExtractComponentPlugin::<WispInputs>::default(),
             ExtractComponentPlugin::<WispPassTargets>::default(),
             ExtractResourcePlugin::<FrameGlobals>::default(),
+            ExtractResourcePlugin::<AppGlobalValues>::default(),
         ));
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -375,6 +376,7 @@ fn prepare_wisp_uniforms(
     render_device: Res<RenderDevice>,
     render_adapter: Res<RenderAdapter>,
     frame_globals: Res<FrameGlobals>,
+    app_globals: Res<AppGlobalValues>,
     wisps: Res<RenderAssets<GpuWisp>>,
     views: Query<(
         Entity,
@@ -418,7 +420,9 @@ fn prepare_wisp_uniforms(
                         .unwrap_or(view_size);
                     let values = frame_globals.values(resolution, pass_index as u32);
                     offsets.push(bytes.len() as u32);
-                    bytes.extend(pack_globals(globals_schema, &values));
+                    let mut chunk = pack_globals(globals_schema, &values);
+                    pack_app_globals(globals_schema, &app_globals, &mut chunk);
+                    bytes.extend(chunk);
                     bytes.resize(bytes.len().next_multiple_of(align), 0);
                 }
                 let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
