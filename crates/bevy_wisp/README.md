@@ -5,7 +5,8 @@
 The WGSL Interactive Shader Project, based on [Bevy](https://bevy.org), inspired by [ISF](https://isf.video/).
 
 A *wisp* is a plain `.wgsl` file describing a (possibly multi-pass) fullscreen
-shader. There is no external metadata: the shader's own interface is reflected
+shader, or a `.wesl` file that also imports from other modules and packages
+(see [WESL](#wesl)). There is no external metadata: the shader's own interface is reflected
 via `naga`. Members of its params uniform struct become tweakable inputs, `///`
 doc-comment annotations supply defaults, ranges and pass configuration, and
 each `@fragment`/`@compute` entry point becomes a pass.
@@ -42,7 +43,7 @@ fn main() {
     App::new()
         .add_plugins((DefaultPlugins, WispPlugin))
         .add_systems(Startup, |mut commands: Commands, assets: Res<AssetServer>| {
-            // Typed load: wisps are plain .wgsl, resolved by asset type.
+            // Typed load: wisps are plain .wgsl or .wesl, resolved by asset type.
             let wisp: Handle<Wisp> = assets.load("wisp/my_shader.wgsl");
             // Output goes wherever the camera renders - a window, or an
             // `Image` render target.
@@ -62,7 +63,7 @@ For low latency, windows displaying a wisp prefer `PresentMode::Mailbox`
 back gracefully where unsupported. Opt out via `WispConfig::prefer_mailbox`
 or by setting a present mode explicitly.
 
-Try the examples: `simple`, `multipass`, `compute`, `image`,
+Try the examples: `simple`, `multipass`, `compute`, `image`, `wesl`,
 `ui` (`--features ui`) and `audio` (`--features audio`), e.g.
 
 ```sh
@@ -179,14 +180,47 @@ A `@compute` entry point must have a target, written through a write-only
 `dispatch = "$WIDTH/8, $HEIGHT/8, 1"` (evaluated against the *target* size).
 Compute targets are never cleared.
 
+## WESL
+
+A wisp can also be a `.wesl` file: [WESL](https://wesl-lang.dev) is WGSL plus
+`import`s and `@if` conditional compilation. Wisp links it into one WGSL module
+when it loads, then reflects and renders that module like any `.wgsl` wisp. The
+conventions and annotations above are unchanged.
+
+```wgsl
+import super::lib::palette::rainbow;   // assets/wisp/lib/palette.wesl
+import shapes::circle::circle;          // a registered package
+```
+
+- **Local modules** are other assets. The module path is the asset path without
+  its extension, read as `.wesl` (or `.wgsl`). `super::` is the wisp's own
+  folder and `package::` is the root of the asset source. Editing an imported
+  module reloads every wisp that imports it.
+- **Packages** are `wesl` [`StaticPackage`](https://docs.rs/wesl)s, usually built
+  by `wesl::PackageBuilder` in a build script and included with `wesl_pkg!`.
+  Register them before adding the plugin:
+
+  ```rust,ignore
+  app.insert_resource(WispConfig {
+      wesl_packages: vec![&my_shader_lib::PACKAGE],
+      ..default()
+  })
+  .add_plugins(WispPlugin);
+  ```
+
+Every `@if` flag is off. Declarations in the wisp's own file keep their names
+and `///` annotations; unused imported declarations are dropped. See the `wesl`
+example, which imports from both.
+
 ## Errors and hot reload
 
 Wisp validates at load time with the same `naga` that compiles the shader, so
 errors carry exact source spans. Failed loads never replace the loaded asset -
 the last working shader keeps rendering while `WispErrors` (and the `ui`
-panel) show what went wrong. Wisp shaders are plain WGSL: bevy hands them to
-wgpu untouched (WESL imports and `@if` apply only to `.wesl` shaders), so what
-wisp reflects is exactly what the GPU compiles.
+panel) show what went wrong. A `.wgsl` wisp is handed to wgpu untouched, so
+what wisp reflects is exactly what the GPU compiles. A `.wesl` wisp is linked
+first: WESL errors (syntax, imports) point into the original files, and naga
+errors point into the linked WGSL, which is again exactly what the GPU compiles.
 
 ## Cargo features
 

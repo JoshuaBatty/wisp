@@ -5,16 +5,16 @@
 The WGSL Interactive Shader Project, based on [Bevy](https://bevy.org), inspired
 by [ISF](https://isf.video/).
 
-A *wisp* is a plain `.wgsl` file describing a (possibly multi-pass) fullscreen
-shader, with its tweakable interface reflected from the shader itself - no
-external metadata.
+A *wisp* is a plain `.wgsl` (or `.wesl`) file describing a (possibly
+multi-pass) fullscreen shader, with its tweakable interface reflected from the
+shader itself - no external metadata.
 
 This is a Cargo workspace of two crates:
 
 - [`bevy_wisp`](crates/bevy_wisp) - the library: a Bevy plugin that turns
-  `.wgsl` wisps into rendered, hot-reloadable, introspectable shaders. Its
-  [README](crates/bevy_wisp/README.md) is the full guide (shader conventions,
-  passes, inputs, errors).
+  `.wgsl` and `.wesl` wisps into rendered, hot-reloadable, introspectable
+  shaders. Its [README](crates/bevy_wisp/README.md) is the full guide (shader
+  conventions, passes, inputs, errors, WESL).
 - [`wisp_editor`](crates/wisp_editor) - a live-coding editor pairing a
   syntax-highlighted code editor with an auto-generated param panel; runs
   natively (`cargo run -p wisp_editor`) and on the web

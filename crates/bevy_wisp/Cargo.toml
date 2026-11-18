@@ -1,10 +1,10 @@
 [package]
 name = "bevy_wisp"
 version = "0.3.0"
-description = "Interactive WGSL shaders for Bevy - reflected inputs, multi-pass rendering, hot reload."
+description = "Interactive WGSL and WESL shaders for Bevy - reflected inputs, multi-pass rendering, hot reload."
 documentation = "https://docs.rs/bevy_wisp"
 readme = "README.md"
-keywords = ["bevy", "wgsl", "shader", "live-coding", "creative-coding"]
+keywords = ["bevy", "wgsl", "wesl", "shader", "live-coding"]
 categories = ["game-development", "graphics", "rendering"]
 authors.workspace = true
 repository.workspace = true
@@ -43,6 +43,9 @@ half = { version = "2", optional = true }
 naga = { version = "30", default-features = false, features = ["wgsl-in"] }
 rustfft = { version = "6", optional = true }
 thiserror = "2"
+# Links `.wesl` wisps. The same version `bevy_shader` uses for its own WESL
+# support, so it adds nothing to the dependency tree.
+wesl = { version = "0.6", default-features = false }
 
 [dev-dependencies]
 # The examples want windowing, winit and friends.

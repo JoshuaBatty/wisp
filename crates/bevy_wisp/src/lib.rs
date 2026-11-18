@@ -1,7 +1,8 @@
-//! Wisp - interactive WGSL shaders for Bevy.
+//! Wisp - interactive WGSL and WESL shaders for Bevy.
 //!
 //! A *wisp* is a plain `.wgsl` file describing a (possibly multi-pass) fullscreen
-//! shader. There is no external metadata: the shader's own interface is reflected
+//! shader, or a `.wesl` file that imports from other modules and packages (see
+//! [`link`]). There is no external metadata: the shader's own interface is reflected
 //! via naga. Members of its params uniform struct become tweakable inputs, `///`
 //! doc-comment annotations supply defaults, ranges and pass configuration, and
 //! each `@fragment`/`@compute` entry point becomes a pass.
@@ -35,7 +36,8 @@
 //! component.
 //!
 //! See [`schema`] for the full set of conventions and annotations, [`globals`] for
-//! the recognized globals members, and [`asset`] for how loading works.
+//! the recognized globals members, [`asset`] for how loading works, and [`link`]
+//! for WESL.
 //!
 //! Wisp grew out of [nannou](https://nannou.cc)'s `nannou_isf` (an implementation
 //! of the Interactive Shader Format) and is the modern, WGSL-first successor to
@@ -65,6 +67,7 @@ pub mod error;
 pub mod example_shaders;
 pub mod globals;
 pub mod inputs;
+pub mod link;
 pub mod reflect;
 pub mod render;
 pub mod schema;
@@ -99,6 +102,10 @@ pub struct WispConfig {
     /// Disable to embed the widgets in your own UI via `ui::params_ui` and
     /// `ui::errors_ui` instead (see the `editor` example).
     pub ui_window: bool,
+    /// The WESL packages that `.wesl` wisps can import, such as
+    /// `import my_lib::noise::fbm;` (see [`link`]). Read once, when the plugin is
+    /// added.
+    pub wesl_packages: Vec<&'static link::StaticPackage>,
 }
 
 impl Default for WispConfig {
@@ -106,6 +113,7 @@ impl Default for WispConfig {
         Self {
             prefer_mailbox: true,
             ui_window: true,
+            wesl_packages: Vec::new(),
         }
     }
 }
@@ -114,10 +122,11 @@ pub struct WispPlugin;
 
 impl Plugin for WispPlugin {
     fn build(&self, app: &mut App) {
-        app.init_asset::<Wisp>()
+        // The loader reads `WispConfig`, so the config comes first.
+        app.init_resource::<WispConfig>()
+            .init_asset::<Wisp>()
             .init_asset_loader::<WispLoader>()
             .init_resource::<FrameGlobals>()
-            .init_resource::<WispConfig>()
             .init_resource::<WispErrors>()
             .add_plugins(render::WispRenderPlugin)
             .add_systems(

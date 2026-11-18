@@ -1,11 +1,11 @@
 //! WGSL parsing, validation and analysis via `naga`.
 //!
-//! Wisp shaders are plain WGSL - the same source that bevy compiles is parsed here
+//! Wisp shaders are WGSL - the same source that bevy compiles is parsed here
 //! (with doc comments retained) so that [`crate::schema`] can reflect the shader's
-//! interface. Bevy hands WGSL to wgpu untouched (WESL imports and `@if`
-//! conditional compilation apply only to `.wesl` shaders), so what wisp reflects
-//! and what the GPU compiles never diverge, and error line numbers always match
-//! the file on disk.
+//! interface. Bevy hands WGSL to wgpu untouched, so what wisp reflects and what
+//! the GPU compiles never diverge. For a `.wgsl` wisp, error line numbers match
+//! the file on disk; a `.wesl` wisp is reflected after linking (see
+//! [`crate::link`]), so its line numbers are those of the linked WGSL.
 
 use naga::front::wgsl;
 use naga::valid::{Capabilities, ModuleInfo, ValidationFlags, Validator};

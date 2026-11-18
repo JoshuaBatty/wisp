@@ -2068,6 +2068,7 @@ dependencies = [
  "naga",
  "rustfft",
  "thiserror 2.0.18",
+ "wesl",
 ]
 
 [[package]]
