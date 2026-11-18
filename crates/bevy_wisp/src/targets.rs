@@ -4,22 +4,24 @@
 //! Targets are (re)allocated when the view size, target size expression, format or
 //! feedback-ness changes. Self-feedback passes get a ping-pong image pair whose
 //! roles swap each frame, so a pass can read its own previous output while
-//! writing the next.
+//! writing the next. Volume targets are 3d images, sized by their own
+//! `width`/`height`/`depth` expressions.
 
 use crate::asset::{Wisp, WispHandle};
 use crate::render::supports_compute;
-use crate::schema::{PassSchema, PassStage, TargetSchema, WispSchema, eval_size, requires_compute};
+use crate::schema::{
+    PassSchema, PassStage, TargetSchema, WispSchema, eval_size, eval_size_3d, requires_compute,
+};
 use bevy_asset::prelude::{Assets, Handle};
 use bevy_camera::{Camera, RenderTarget};
 use bevy_ecs::prelude::*;
 use bevy_image::prelude::Image;
 use bevy_log::warn_once;
-use bevy_math::UVec2;
+use bevy_math::{UVec2, UVec3};
 use bevy_render::RenderApp;
 use bevy_render::extract_component::ExtractComponent;
-use bevy_render::render_resource::{Extent3d, TextureUsages};
+use bevy_render::render_resource::{Extent3d, TextureDimension, TextureUsages};
 use bevy_render::renderer::RenderAdapter;
-use bevy_utils::default;
 use bevy_window::{PrimaryWindow, Window, WindowRef};
 
 /// The intermediate target images for a wisp camera, parallel to the schema's
@@ -30,7 +32,8 @@ pub struct WispPassTargets(pub Vec<Option<PassTarget>>);
 
 #[derive(Clone, Debug)]
 pub struct PassTarget {
-    pub size: UVec2,
+    /// The target's size in pixels; `z` is the depth of a volume, 1 otherwise.
+    pub size: UVec3,
     /// Clear the write image at the start of the pass (non-persistent targets).
     /// Compute targets are never cleared - the shader overwrites what it covers.
     pub clear: bool,
@@ -140,6 +143,7 @@ fn sync_targets(
         };
         let size = target_size(target, view_size);
         let clear = !target.persistent;
+        let volume = target.is_volume();
         let dispatch = match pass.stage {
             PassStage::Fragment => None,
             PassStage::Compute => Some(dispatch_size(pass, size)),
@@ -149,9 +153,10 @@ fn sync_targets(
                 && t.clear == clear
                 && t.dispatch == dispatch
                 && (t.images[0] != t.images[1]) == pass.self_feedback
-                && images
-                    .get(&t.images[0])
-                    .is_some_and(|image| image.texture_descriptor.format == target.format)
+                && images.get(&t.images[0]).is_some_and(|image| {
+                    image.texture_descriptor.format == target.format
+                        && (image.texture_descriptor.dimension == TextureDimension::D3) == volume
+                })
         });
         if up_to_date {
             // Keep the contents; just advance the ping-pong.
@@ -162,9 +167,10 @@ fn sync_targets(
             }
             continue;
         }
-        let mut usage = TextureUsages::RENDER_ATTACHMENT
-            | TextureUsages::TEXTURE_BINDING
-            | TextureUsages::COPY_DST;
+        let mut usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+        if !volume {
+            usage |= TextureUsages::RENDER_ATTACHMENT;
+        }
         if pass.stage == PassStage::Compute {
             usage |= TextureUsages::STORAGE_BINDING;
         }
@@ -172,11 +178,20 @@ fn sync_targets(
             let mut image = Image::default();
             image.texture_descriptor.format = target.format;
             image.texture_descriptor.usage = usage;
-            image.resize(Extent3d {
+            let extent = Extent3d {
                 width: size.x,
                 height: size.y,
-                ..default()
-            });
+                depth_or_array_layers: size.z,
+            };
+            if volume {
+                // No CPU copy: a volume is filled on the GPU, and its size
+                // (e.g. 256^3 at 8 bytes a voxel) is too large to mirror.
+                image.texture_descriptor.dimension = TextureDimension::D3;
+                image.texture_descriptor.size = extent;
+                image.data = None;
+            } else {
+                image.resize(extent);
+            }
             images.add(image)
         };
         let first = new_image();
@@ -196,11 +211,11 @@ fn sync_targets(
 
 /// A compute pass's workgroup counts: explicit `dispatch = ".."` expressions
 /// evaluated against the *target* size, or derived as `ceil(target / workgroup)`.
-fn dispatch_size(pass: &PassSchema, target_size: UVec2) -> [u32; 3] {
+fn dispatch_size(pass: &PassSchema, target_size: UVec3) -> [u32; 3] {
     match &pass.dispatch {
         Some(exprs) => {
             let eval = |expr: &String| {
-                eval_size(expr, target_size).unwrap_or_else(|err| {
+                eval_size_3d(expr, target_size).unwrap_or_else(|err| {
                     warn_once!("wisp: {err}; dispatching a single workgroup");
                     1
                 })
@@ -208,21 +223,23 @@ fn dispatch_size(pass: &PassSchema, target_size: UVec2) -> [u32; 3] {
             [eval(&exprs[0]), eval(&exprs[1]), eval(&exprs[2])]
         }
         None => {
-            let [x, y, _] = pass.workgroup_size;
+            let [x, y, z] = pass.workgroup_size;
             [
                 target_size.x.div_ceil(x.max(1)),
                 target_size.y.div_ceil(y.max(1)),
-                1,
+                target_size.z.div_ceil(z.max(1)),
             ]
         }
     }
 }
 
-/// A target's pixel size for the given view size.
+/// A target's pixel size for the given view size; `z` is the depth of a
+/// volume, 1 otherwise.
 ///
 /// Expressions were validated at load time; should one still fail for this
-/// particular view size (e.g. going non-positive), fall back to the view size.
-fn target_size(target: &TargetSchema, view_size: UVec2) -> UVec2 {
+/// particular view size (e.g. going non-positive), fall back to the view size
+/// (and a depth of 1).
+fn target_size(target: &TargetSchema, view_size: UVec2) -> UVec3 {
     let dim = |expr: &Option<String>, base: u32| match expr {
         None => base,
         Some(expr) => eval_size(expr, view_size).unwrap_or_else(|err| {
@@ -230,8 +247,9 @@ fn target_size(target: &TargetSchema, view_size: UVec2) -> UVec2 {
             base
         }),
     };
-    UVec2::new(
+    UVec3::new(
         dim(&target.width, view_size.x),
         dim(&target.height, view_size.y),
+        dim(&target.depth, 1),
     )
 }

@@ -63,7 +63,7 @@ For low latency, windows displaying a wisp prefer `PresentMode::Mailbox`
 back gracefully where unsupported. Opt out via `WispConfig::prefer_mailbox`
 or by setting a present mode explicitly.
 
-Try the examples: `simple`, `multipass`, `compute`, `image`, `wesl`,
+Try the examples: `simple`, `multipass`, `compute`, `volume`, `image`, `wesl`,
 `ui` (`--features ui`) and `audio` (`--features audio`), e.g.
 
 ```sh
@@ -149,6 +149,10 @@ Unknown annotations are load errors, so typos can't pass silently.
 - anything else is an *image input*, settable by name through `WispInputs`
   (a placeholder image is bound until set).
 
+`texture_3d<f32>` bindings follow the same rules: one named after a volume
+target reads that volume (see [Volumes](#volumes)); anything else is a 3d image
+input, which reads as black until it is set to a 3d image.
+
 All samplers are bound to the default filtering sampler.
 
 ## Passes
@@ -179,6 +183,37 @@ A `@compute` entry point must have a target, written through a write-only
 `ceil(target_size / workgroup_size)`, or set
 `dispatch = "$WIDTH/8, $HEIGHT/8, 1"` (evaluated against the *target* size).
 Compute targets are never cleared.
+
+### Volumes
+
+A compute pass whose `@pass` gives a `depth` writes a *volume*: a 3d target,
+like a Shadertoy Volume buffer. It is written through a `texture_storage_3d`
+named `<target>_out` and read by any pass as a `texture_3d<f32>` of the
+target's name. A volume that reads itself sees its previous frame, as a 2d
+target does.
+
+```wgsl
+@group(1) @binding(1) var smoke: texture_3d<f32>;
+@group(1) @binding(2) var smoke_out: texture_storage_3d<rgba16float, write>;
+
+/// @pass(target = "smoke", float, width = 128, height = 128, depth = 128)
+@compute @workgroup_size(4, 4, 4)
+fn bake(@builtin(global_invocation_id) id: vec3<u32>) { .. }
+```
+
+- `width`, `height` and `depth` are all required: a volume never takes the view
+  size.
+- The default dispatch covers all three axes; in a `dispatch` expression
+  `$DEPTH` is the target's depth.
+- The `resolution` global reports a volume pass's width and height; use
+  `textureDimensions` for all three.
+- Only compute passes write volumes. Fragment passes read them, for example to
+  raymarch: `textureSampleLevel(smoke, samp, p, 0.0)`.
+- Mind the size: 256^3 at `float` is 128 MiB, twice that when the pass reads its
+  own volume.
+
+The `volume` example (`assets/wisp/test_volume.wgsl`) bakes rising smoke into a
+volume and raymarches it.
 
 ## WESL
 

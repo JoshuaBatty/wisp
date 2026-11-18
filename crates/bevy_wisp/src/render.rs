@@ -27,7 +27,7 @@ use bevy_render::extract_component::ExtractComponentPlugin;
 use bevy_render::extract_resource::ExtractResourcePlugin;
 use bevy_render::render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets};
 use bevy_render::render_resource::binding_types::{
-    sampler, texture_2d, texture_storage_2d, uniform_buffer_sized,
+    sampler, texture_2d, texture_3d, texture_storage_2d, texture_storage_3d, uniform_buffer_sized,
 };
 use bevy_render::render_resource::*;
 use bevy_render::renderer::{RenderAdapter, RenderContext, RenderDevice, ViewQuery};
@@ -59,11 +59,16 @@ pub enum WispPassPipelineId {
     Compute(CachedComputePipelineId),
 }
 
-/// Lazily-created 1x1 storage textures, bound in place of a pass target's
-/// storage view in every pass except the one that writes it (binding the real
-/// view there would conflict with sampling it).
+/// Lazily-created 1x1(x1) storage textures, keyed by format and dimension,
+/// bound in place of a pass target's storage view in every pass except the one
+/// that writes it (binding the real view there would conflict with sampling it).
 #[derive(Resource, Default)]
-struct WispDummyStorage(HashMap<TextureFormat, TextureView>);
+struct WispDummyStorage(HashMap<(TextureFormat, TextureDimension), TextureView>);
+
+/// A 1x1x1 black 3d texture, bound to a `texture_3d` with nothing to read:
+/// an unset volume input, or a volume target not built yet.
+#[derive(Resource)]
+struct WispDummyVolume(TextureView);
 
 /// Per-view uniform buffers, rewritten each frame.
 #[derive(Component)]
@@ -163,7 +168,9 @@ impl Plugin for WispRenderPlugin {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
-        render_app.init_resource::<WispPipelines>();
+        render_app
+            .init_resource::<WispPipelines>()
+            .init_resource::<WispDummyVolume>();
     }
 }
 
@@ -279,11 +286,19 @@ pub fn bind_group_layout_descriptors(bindings: &[BindingDesc]) -> Vec<BindGroupL
                         texture_2d(TextureSampleType::Float { filterable: true })
                             .build(b.binding, b.visibility)
                     }
+                    BindingTy::Texture3d => {
+                        texture_3d(TextureSampleType::Float { filterable: true })
+                            .build(b.binding, b.visibility)
+                    }
                     BindingTy::Sampler => {
                         sampler(SamplerBindingType::Filtering).build(b.binding, b.visibility)
                     }
                     BindingTy::StorageTexture2d { format } => {
                         texture_storage_2d(*format, StorageTextureAccess::WriteOnly)
+                            .build(b.binding, b.visibility)
+                    }
+                    BindingTy::StorageTexture3d { format } => {
+                        texture_storage_3d(*format, StorageTextureAccess::WriteOnly)
                             .build(b.binding, b.visibility)
                     }
                 })
@@ -395,11 +410,11 @@ fn prepare_wisp_uniforms(
                 let mut bytes = Vec::new();
                 let mut offsets = Vec::new();
                 for (pass_index, _pass) in schema.passes.iter().enumerate() {
-                    // Each pass sees its own target's resolution; the final pass
-                    // sees the view's.
+                    // Each pass sees its own target's resolution (a volume's
+                    // width and height); the final pass sees the view's.
                     let resolution = pass_targets
                         .and_then(|targets| targets.0.get(pass_index)?.as_ref())
-                        .map(|target| target.size.as_vec2())
+                        .map(|target| target.size.truncate().as_vec2())
                         .unwrap_or(view_size);
                     let values = frame_globals.values(resolution, pass_index as u32);
                     offsets.push(bytes.len() as u32);
@@ -443,6 +458,7 @@ fn prepare_wisp_bind_groups(
     gpu_images: Res<RenderAssets<GpuImage>>,
     wisps: Res<RenderAssets<GpuWisp>>,
     mut dummy_storage: ResMut<WispDummyStorage>,
+    dummy_volume: Res<WispDummyVolume>,
     views: Query<(
         Entity,
         &WispHandle,
@@ -467,8 +483,14 @@ fn prepare_wisp_bind_groups(
         // Ensure a placeholder storage view exists for every storage format
         // before bind group creation borrows the map immutably.
         for binding in &wisp.schema.bindings {
-            if let BindingTy::StorageTexture2d { format } = binding.ty {
-                dummy_storage.entry(format, &render_device);
+            match binding.ty {
+                BindingTy::StorageTexture2d { format } => {
+                    dummy_storage.entry(format, TextureDimension::D2, &render_device);
+                }
+                BindingTy::StorageTexture3d { format } => {
+                    dummy_storage.entry(format, TextureDimension::D3, &render_device);
+                }
+                _ => {}
             }
         }
         let mut dynamic_group = None;
@@ -481,6 +503,7 @@ fn prepare_wisp_bind_groups(
                     inputs,
                     pass_targets,
                     dummy,
+                    &dummy_volume,
                     &dummy_storage,
                     &gpu_images,
                     &default_sampler,
@@ -509,6 +532,7 @@ fn create_pass_bind_groups(
     inputs: &WispInputs,
     pass_targets: Option<&WispPassTargets>,
     dummy: &GpuImage,
+    dummy_volume: &WispDummyVolume,
     dummy_storage: &WispDummyStorage,
     gpu_images: &RenderAssets<GpuImage>,
     default_sampler: &DefaultImageSampler,
@@ -563,6 +587,16 @@ fn create_pass_bind_groups(
                         .texture_view
                         .into_binding()
                 }
+                BindingTy::Texture3d => {
+                    // Only a 3d image may be bound here: an input still at its
+                    // 2d placeholder (or set to a 2d image) reads as black.
+                    texture_image(schema, binding, inputs, pass_index, pass_targets)
+                        .and_then(|handle| gpu_images.get(&handle))
+                        .filter(|image| image.texture.dimension() == TextureDimension::D3)
+                        .map(|image| &image.texture_view)
+                        .unwrap_or(&dummy_volume.0)
+                        .into_binding()
+                }
                 BindingTy::StorageTexture2d { format } => storage_view(
                     schema,
                     binding,
@@ -570,7 +604,17 @@ fn create_pass_bind_groups(
                     pass_targets,
                     gpu_images,
                     dummy_storage,
-                    *format,
+                    (*format, TextureDimension::D2),
+                )?
+                .into_binding(),
+                BindingTy::StorageTexture3d { format } => storage_view(
+                    schema,
+                    binding,
+                    pass_index,
+                    pass_targets,
+                    gpu_images,
+                    dummy_storage,
+                    (*format, TextureDimension::D3),
                 )?
                 .into_binding(),
             };
@@ -628,9 +672,15 @@ fn texture_image(
 }
 
 impl WispDummyStorage {
-    /// The placeholder storage view for a format, creating it on first use.
-    fn entry(&mut self, format: TextureFormat, render_device: &RenderDevice) {
-        self.0.entry(format).or_insert_with(|| {
+    /// The placeholder storage view for a format and dimension, creating it on
+    /// first use.
+    fn entry(
+        &mut self,
+        format: TextureFormat,
+        dimension: TextureDimension,
+        render_device: &RenderDevice,
+    ) {
+        self.0.entry((format, dimension)).or_insert_with(|| {
             let texture = render_device.create_texture(&TextureDescriptor {
                 label: Some("wisp_dummy_storage"),
                 size: Extent3d {
@@ -640,13 +690,36 @@ impl WispDummyStorage {
                 },
                 mip_level_count: 1,
                 sample_count: 1,
-                dimension: TextureDimension::D2,
+                dimension,
                 format,
                 usage: TextureUsages::STORAGE_BINDING,
                 view_formats: &[],
             });
             texture.create_view(&TextureViewDescriptor::default())
         });
+    }
+}
+
+impl FromWorld for WispDummyVolume {
+    fn from_world(world: &mut World) -> Self {
+        let render_device = world.resource::<RenderDevice>();
+        let texture = render_device.create_texture(&TextureDescriptor {
+            label: Some("wisp_dummy_volume"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D3,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        // wgpu zero-initialises the texture on first use, so it reads as
+        // transparent black.
+        Self(texture.create_view(&TextureViewDescriptor::default()))
     }
 }
 
@@ -662,9 +735,9 @@ fn storage_view<'a>(
     pass_targets: Option<&'a WispPassTargets>,
     gpu_images: &'a RenderAssets<GpuImage>,
     dummy_storage: &'a WispDummyStorage,
-    format: TextureFormat,
+    key: (TextureFormat, TextureDimension),
 ) -> Option<&'a TextureView> {
-    let dummy = dummy_storage.0.get(&format);
+    let dummy = dummy_storage.0.get(&key);
     let texture = schema
         .textures
         .iter()

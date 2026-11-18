@@ -35,4 +35,8 @@ pub const ALL: &[(&str, &str)] = &[
         "test_persistent_buffer",
         include_str!("../assets/wisp/test_persistent_buffer.wgsl"),
     ),
+    (
+        "test_volume",
+        include_str!("../assets/wisp/test_volume.wgsl"),
+    ),
 ];
