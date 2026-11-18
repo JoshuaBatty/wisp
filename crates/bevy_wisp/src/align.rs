@@ -24,31 +24,45 @@ const PAD_FIELD: &str = "_wisp_align_pad";
 /// `@group(0)`/`@group(1)` whose byte size is not a multiple of 16, returning
 /// the rewritten source. `module` must be the reflection of `source`.
 pub(crate) fn pad_uniform_structs(source: &str, module: &naga::Module) -> String {
-    let mut targets: Vec<(usize, u32)> = module
+    let mut targets: Vec<PadTarget> = module
         .global_variables
         .iter()
         .filter_map(|(_, var)| pad_target(source, module, var))
         .collect();
     // Insert from the latest position first so earlier byte offsets stay valid.
-    targets.sort_by_key(|&(close, _)| std::cmp::Reverse(close));
+    targets.sort_by_key(|target| std::cmp::Reverse(target.close));
     let mut out = source.to_string();
-    for (close, floats) in targets {
-        let field: String = (0..floats)
+    for target in targets {
+        let field: String = (0..target.floats)
             .map(|i| format!("\n    {PAD_FIELD}_{i}: f32,"))
             .collect();
-        out.insert_str(close, &format!("{field}\n"));
+        out.insert_str(target.close, &format!("{field}\n"));
+        // WGSL allows the last member without a trailing comma (and the WESL
+        // linker prints structs that way), so add one before the padding.
+        if let Some(comma) = target.comma {
+            out.insert(comma, ',');
+        }
     }
     out
 }
 
-/// The closing-brace byte index and `f32` padding count for a uniform struct
-/// that needs padding, or `None` if it is already 16-byte aligned (or not a
-/// wisp uniform).
+/// Where to pad one uniform struct.
+struct PadTarget {
+    /// Byte index of the struct's closing `}`.
+    close: usize,
+    /// Byte index just past the last member, when it has no trailing comma.
+    comma: Option<usize>,
+    /// How many `f32` members to append.
+    floats: u32,
+}
+
+/// Where and how much to pad a uniform struct, or `None` if it is already
+/// 16-byte aligned (or not a wisp uniform).
 fn pad_target(
     source: &str,
     module: &naga::Module,
     var: &naga::GlobalVariable,
-) -> Option<(usize, u32)> {
+) -> Option<PadTarget> {
     if var.space != naga::AddressSpace::Uniform {
         return None;
     }
@@ -69,7 +83,43 @@ fn pad_target(
     // within it is that brace (struct members contain no braces of their own).
     let range = module.types.get_span(var.ty).to_range()?;
     let close = source.get(..range.end)?.rfind('}')?;
-    Some((close, (16 - remainder) / 4))
+    let open = range.start + source.get(range.start..close)?.find('{')?;
+    let comma = last_code_char(&source[open + 1..close])
+        .filter(|&(_, c)| c != ',')
+        .map(|(index, c)| open + 1 + index + c.len_utf8());
+    Some(PadTarget {
+        close,
+        comma,
+        floats: (16 - remainder) / 4,
+    })
+}
+
+/// The byte index and value of the last character of `text` that is neither
+/// whitespace nor inside a comment.
+fn last_code_char(text: &str) -> Option<(usize, char)> {
+    let mut last = None;
+    let mut chars = text.char_indices().peekable();
+    let mut block_depth = 0usize;
+    while let Some((index, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, next)| next);
+        if block_depth > 0 {
+            if c == '*' && next == Some('/') {
+                chars.next();
+                block_depth -= 1;
+            } else if c == '/' && next == Some('*') {
+                chars.next();
+                block_depth += 1;
+            }
+        } else if c == '/' && next == Some('/') {
+            while chars.next_if(|&(_, c)| c != '\n').is_some() {}
+        } else if c == '/' && next == Some('*') {
+            chars.next();
+            block_depth = 1;
+        } else if !c.is_whitespace() {
+            last = Some((index, c));
+        }
+    }
+    last
 }
 
 #[cfg(test)]
@@ -115,6 +165,26 @@ fn frag() -> @location(0) vec4<f32> {
         let padded = pad_uniform_structs(SHADER, &module);
         // The padded source still parses and validates, now at 16 bytes.
         assert_eq!(uniform_size(&padded, 1), 16);
+    }
+
+    #[test]
+    fn pads_structs_without_a_trailing_comma() {
+        let source = "\
+struct Globals { resolution: vec2<f32>, time: f32 /* seconds */ }
+@group(0) @binding(0) var<uniform> globals: Globals;
+struct Params {
+    wobble: f32 // how much
+}
+@group(1) @binding(0) var<uniform> params: Params;
+@fragment
+fn frag() -> @location(0) vec4<f32> {
+    return vec4<f32>(params.wobble * globals.time);
+}
+";
+        let module = parse_and_validate(source).unwrap().module;
+        let padded = pad_uniform_structs(source, &module);
+        assert_eq!(uniform_size(&padded, 0), 16, "{padded}");
+        assert_eq!(uniform_size(&padded, 1), 16, "{padded}");
     }
 
     #[test]
