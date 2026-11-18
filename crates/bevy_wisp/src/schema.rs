@@ -18,11 +18,14 @@
 //!   the view. A pass's named target can be read by any pass as a `texture_2d<f32>`
 //!   of the same name; a compute pass writes its target through a
 //!   `texture_storage_2d` named `<target>_out`.
+//! - A compute pass whose `@pass` gives a `depth` writes a *volume*: a 3d target,
+//!   written through a `texture_storage_3d` named `<target>_out` and read as a
+//!   `texture_3d<f32>` of the target's name.
 
 use crate::annot::{self, Annotation, Arg, Docs, Value};
 use crate::globals::{GlobalKind, GlobalsSchema};
 use crate::reflect::ReflectedModule;
-use bevy_math::UVec2;
+use bevy_math::{UVec2, UVec3};
 use bevy_render::render_resource::{ShaderStages, TextureFormat};
 use naga::ir::DocComments;
 use std::collections::BTreeMap;
@@ -80,10 +83,14 @@ pub enum BindingTy {
     Params { size: u32 },
     /// A filterable 2d float texture.
     Texture2d,
+    /// A filterable 3d float texture.
+    Texture3d,
     /// A filtering sampler.
     Sampler,
     /// A write-only 2d storage texture.
     StorageTexture2d { format: TextureFormat },
+    /// A write-only 3d storage texture.
+    StorageTexture3d { format: TextureFormat },
 }
 
 /// The reflected params uniform struct: the shader's tweakable inputs.
@@ -148,6 +155,8 @@ pub struct TextureSchema {
     pub group: u32,
     pub binding: u32,
     pub role: TextureRole,
+    /// Whether the binding is 3d (`texture_3d` or `texture_storage_3d`).
+    pub volume: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -203,6 +212,15 @@ pub struct TargetSchema {
     /// `$WIDTH`/`$HEIGHT` size expressions; the target size defaults to the view size.
     pub width: Option<String>,
     pub height: Option<String>,
+    /// The depth expression of a volume target; `None` for a 2d target.
+    pub depth: Option<String>,
+}
+
+impl TargetSchema {
+    /// Whether the target is a volume (a 3d texture).
+    pub fn is_volume(&self) -> bool {
+        self.depth.is_some()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -282,15 +300,19 @@ pub enum SchemaError {
     #[error("multiple final passes: `{first}` and `{second}` both omit `@pass(target = ..)`")]
     MultipleFinalPasses { first: String, second: String },
     #[error(
-        "{context}: pass configuration (persistent/float/width/height/dispatch) \
+        "{context}: pass configuration (persistent/float/width/height/depth/dispatch) \
          requires `target = \"..\"`"
     )]
     FinalPassConfig { context: String },
     #[error("{context}: `dispatch` only applies to `@compute` passes")]
     DispatchOnFragment { context: String },
+    #[error("{context}: `depth` (a volume target) only applies to `@compute` passes")]
+    DepthOnFragment { context: String },
+    #[error("{context}: a volume target needs `width`, `height` and `depth`")]
+    VolumeSize { context: String },
     #[error(
         "{context}: unknown `@pass` argument `{arg}` (supported: target, \
-         persistent, float, width, height, dispatch)"
+         persistent, float, width, height, depth, dispatch)"
     )]
     PassArg { context: String, arg: String },
     #[error("{context}: `dispatch` expects 1-3 comma-separated expressions")]
@@ -303,9 +325,16 @@ pub enum SchemaError {
     DuplicateBinding { group: u32, binding: u32 },
     #[error(
         "compute pass `{entry}` targets `{target}` but declares no \
-         `texture_storage_2d` named `{target}_out`"
+         `texture_storage_2d` (`texture_storage_3d` for a volume) named `{target}_out`"
     )]
     MissingStorageTexture { entry: String, target: String },
+    #[error("`{name}` must be declared `{expected}`: its target `{target}` is {kind}")]
+    TargetDimension {
+        name: String,
+        target: String,
+        kind: &'static str,
+        expected: &'static str,
+    },
     #[error("storage texture `{name}` must be named `<target>_out` after a `@compute` pass target")]
     StorageTextureName { name: String },
     #[error("storage texture `{name}`: no `@compute` pass targets `{target}`")]
@@ -321,8 +350,8 @@ pub enum SchemaError {
         expected: &'static str,
     },
     #[error(
-        "texture `{name}` has an unsupported type (only `texture_2d<f32>` and 2d \
-         `texture_storage_2d` are supported)"
+        "texture `{name}` has an unsupported type (only `texture_2d<f32>`, \
+         `texture_3d<f32>`, `texture_storage_2d` and `texture_storage_3d` are supported)"
     )]
     UnsupportedTexture { name: String },
     #[error(
@@ -459,13 +488,14 @@ pub fn schema_from_module(reflected: &ReflectedModule) -> Result<WispSchema, Sch
             }
             naga::AddressSpace::Handle => match module.types[var.ty].inner {
                 naga::TypeInner::Image {
-                    dim: naga::ImageDimension::D2,
+                    dim: dim @ (naga::ImageDimension::D2 | naga::ImageDimension::D3),
                     arrayed: false,
                     class,
                 } => {
                     if group != 1 {
                         return Err(SchemaError::BadGroup { name, group });
                     }
+                    let volume = dim == naga::ImageDimension::D3;
                     match class {
                         naga::ImageClass::Sampled {
                             kind: naga::ScalarKind::Float,
@@ -476,6 +506,18 @@ pub fn schema_from_module(reflected: &ReflectedModule) -> Result<WispSchema, Sch
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[]);
                             let role = texture_role(&name, raw, &target_passes)?;
+                            if let TextureRole::PassTarget { pass } = role {
+                                check_target_dimension(&name, &passes[pass], volume, false)?;
+                            }
+                            if volume
+                                && matches!(
+                                    role,
+                                    TextureRole::AudioWaveform { .. }
+                                        | TextureRole::AudioFft { .. }
+                                )
+                            {
+                                return Err(SchemaError::UnsupportedTexture { name });
+                            }
                             textures.push((
                                 handle,
                                 TextureSchema {
@@ -483,13 +525,18 @@ pub fn schema_from_module(reflected: &ReflectedModule) -> Result<WispSchema, Sch
                                     group,
                                     binding,
                                     role,
+                                    volume,
                                 },
                             ));
-                            BindingTy::Texture2d
+                            match volume {
+                                true => BindingTy::Texture3d,
+                                false => BindingTy::Texture2d,
+                            }
                         }
                         naga::ImageClass::Storage { format, access } => {
                             let (pass, format) =
                                 storage_target(&name, format, access, &target_passes, &mut passes)?;
+                            check_target_dimension(&name, &passes[pass], volume, true)?;
                             textures.push((
                                 handle,
                                 TextureSchema {
@@ -497,9 +544,13 @@ pub fn schema_from_module(reflected: &ReflectedModule) -> Result<WispSchema, Sch
                                     group,
                                     binding,
                                     role: TextureRole::StorageTarget { pass },
+                                    volume,
                                 },
                             ));
-                            BindingTy::StorageTexture2d { format }
+                            match volume {
+                                true => BindingTy::StorageTexture3d { format },
+                                false => BindingTy::StorageTexture2d { format },
+                            }
                         }
                         _ => return Err(SchemaError::UnsupportedTexture { name }),
                     }
@@ -611,9 +662,16 @@ pub fn schema_from_module(reflected: &ReflectedModule) -> Result<WispSchema, Sch
 
 /// Evaluate a `$WIDTH`/`$HEIGHT` size expression against the given base size.
 pub fn eval_size(expr: &str, base: UVec2) -> Result<u32, SizeExprError> {
+    eval_size_3d(expr, base.extend(1))
+}
+
+/// Evaluate a `$WIDTH`/`$HEIGHT`/`$DEPTH` size expression against the given
+/// base size. `$DEPTH` is 1 for a 2d base.
+pub fn eval_size_3d(expr: &str, base: UVec3) -> Result<u32, SizeExprError> {
     let resolved = expr
         .replace("$WIDTH", &base.x.to_string())
-        .replace("$HEIGHT", &base.y.to_string());
+        .replace("$HEIGHT", &base.y.to_string())
+        .replace("$DEPTH", &base.z.to_string());
     let value = match evalexpr::eval(&resolved) {
         Ok(evalexpr::Value::Int(i)) => i as f64,
         Ok(evalexpr::Value::Float(f)) => f,
@@ -672,7 +730,7 @@ fn passes_from_entry_points(
         // Catch malformed size expressions at load time rather than at render time.
         let exprs = target
             .iter()
-            .flat_map(|t| [t.width.as_deref(), t.height.as_deref()])
+            .flat_map(|t| [t.width.as_deref(), t.height.as_deref(), t.depth.as_deref()])
             .chain(
                 dispatch
                     .iter()
@@ -736,6 +794,7 @@ fn pass_config(
     let mut float = false;
     let mut width = None;
     let mut height = None;
+    let mut depth = None;
     let mut dispatch = None;
     for arg in &annotation.args {
         match arg {
@@ -754,6 +813,7 @@ fn pass_config(
                 },
                 "width" => width = Some(expr_string(value)),
                 "height" => height = Some(expr_string(value)),
+                "depth" => depth = Some(expr_string(value)),
                 "dispatch" => dispatch = Some(dispatch_exprs(value, context)?),
                 _ => {
                     return Err(SchemaError::PassArg {
@@ -771,7 +831,13 @@ fn pass_config(
         }
     }
     let Some(name) = target_name else {
-        if persistent || float || width.is_some() || height.is_some() || dispatch.is_some() {
+        if persistent
+            || float
+            || width.is_some()
+            || height.is_some()
+            || depth.is_some()
+            || dispatch.is_some()
+        {
             return Err(SchemaError::FinalPassConfig {
                 context: context.to_string(),
             });
@@ -782,6 +848,20 @@ fn pass_config(
         return Err(SchemaError::DispatchOnFragment {
             context: context.to_string(),
         });
+    }
+    if depth.is_some() {
+        if stage == PassStage::Fragment {
+            return Err(SchemaError::DepthOnFragment {
+                context: context.to_string(),
+            });
+        }
+        // A volume defaults to no size: the view size times a depth is rarely
+        // wanted and easily exhausts GPU memory.
+        if width.is_none() || height.is_none() {
+            return Err(SchemaError::VolumeSize {
+                context: context.to_string(),
+            });
+        }
     }
     let format = match (stage, float) {
         (_, true) => TextureFormat::Rgba16Float,
@@ -795,6 +875,7 @@ fn pass_config(
         format,
         width,
         height,
+        depth,
     };
     Ok((Some(target), dispatch))
 }
@@ -1150,6 +1231,35 @@ fn storage_target(
         });
     }
     Ok((pass, expected))
+}
+
+/// Check that a binding reading or writing a pass target matches the target's
+/// dimension: a volume target is a `texture_3d`/`texture_storage_3d`, a 2d
+/// target a `texture_2d`/`texture_storage_2d`.
+fn check_target_dimension(
+    name: &str,
+    pass: &PassSchema,
+    volume: bool,
+    storage: bool,
+) -> Result<(), SchemaError> {
+    let Some(target) = &pass.target else {
+        return Ok(());
+    };
+    if target.is_volume() == volume {
+        return Ok(());
+    }
+    let (kind, expected) = match (target.is_volume(), storage) {
+        (true, true) => ("a volume", "texture_storage_3d"),
+        (true, false) => ("a volume", "texture_3d<f32>"),
+        (false, true) => ("2d", "texture_storage_2d"),
+        (false, false) => ("2d", "texture_2d<f32>"),
+    };
+    Err(SchemaError::TargetDimension {
+        name: name.to_string(),
+        target: target.name.clone(),
+        kind,
+        expected,
+    })
 }
 
 fn check_known(parsed: &Docs, known: &[&str], context: &str) -> Result<(), SchemaError> {
@@ -1555,6 +1665,113 @@ mod tests {
     }
 
     #[test]
+    fn volume_pass_and_reads() {
+        let src = r#"
+            @group(0) @binding(1) var samp: sampler;
+            @group(1) @binding(1) var vol: texture_3d<f32>;
+            @group(1) @binding(2) var vol_out: texture_storage_3d<rgba16float, write>;
+            @group(1) @binding(3) var density: texture_3d<f32>;
+
+            /// @pass(target = "vol", float, width = 64, height = 32, depth = "$WIDTH/30")
+            @compute @workgroup_size(4, 4, 4)
+            fn bake(@builtin(global_invocation_id) id: vec3<u32>) {
+                let c = textureLoad(vol, vec3<i32>(id), 0) + textureLoad(density, vec3<i32>(id), 0);
+                textureStore(vol_out, vec3<i32>(id), c);
+            }
+
+            @fragment
+            fn present(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                return textureSample(vol, samp, vec3<f32>(uv, 0.5));
+            }
+        "#;
+        let s = schema(src);
+        let bake = &s.passes[0];
+        let target = bake.target.as_ref().unwrap();
+        assert!(target.is_volume());
+        assert_eq!(target.depth.as_deref(), Some("$WIDTH/30"));
+        assert_eq!(bake.workgroup_size, [4, 4, 4]);
+        assert!(bake.self_feedback, "the volume pass reads its last frame");
+        let ty = |binding| {
+            s.bindings
+                .iter()
+                .find(|b| (b.group, b.binding) == (1, binding))
+                .unwrap()
+                .ty
+                .clone()
+        };
+        assert_eq!(ty(1), BindingTy::Texture3d);
+        assert_eq!(
+            ty(2),
+            BindingTy::StorageTexture3d {
+                format: TextureFormat::Rgba16Float
+            }
+        );
+        assert_eq!(ty(3), BindingTy::Texture3d);
+        let texture = |name| s.textures.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(texture("vol").role, TextureRole::PassTarget { pass: 0 });
+        assert!(texture("vol").volume);
+        assert_eq!(texture("density").role, TextureRole::ImageInput);
+        assert!(texture("density").volume);
+        assert!(!s.passes[1].target.is_some());
+    }
+
+    #[test]
+    fn volume_errors() {
+        let volume = |pass: &str, storage: &str| {
+            format!(
+                r#"
+                @group(1) @binding(1) var vol_out: {storage};
+                /// @pass({pass})
+                @compute @workgroup_size(4, 4, 4)
+                fn bake() {{}}
+                {FINAL_PASS}
+                "#
+            )
+        };
+        let storage_3d = "texture_storage_3d<rgba8unorm, write>";
+        assert!(matches!(
+            schema_err(&volume(r#"target = "vol", depth = 8"#, storage_3d)),
+            SchemaError::VolumeSize { .. }
+        ));
+        assert!(matches!(
+            schema_err(&volume(
+                r#"target = "vol", width = 8, height = 8, depth = 8"#,
+                "texture_storage_2d<rgba8unorm, write>"
+            )),
+            SchemaError::TargetDimension { expected, .. } if expected == "texture_storage_3d"
+        ));
+        assert!(matches!(
+            schema_err(&volume(r#"target = "vol""#, storage_3d)),
+            SchemaError::TargetDimension { expected, .. } if expected == "texture_storage_2d"
+        ));
+
+        let fragment_depth = r#"
+            /// @pass(target = "vol", width = 8, height = 8, depth = 8)
+            @fragment
+            fn bake() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
+        "#;
+        assert!(matches!(
+            schema_err(&format!("{fragment_depth}{FINAL_PASS}")),
+            SchemaError::DepthOnFragment { .. }
+        ));
+
+        let read_as_2d = format!(
+            r#"
+            @group(1) @binding(1) var vol_out: {storage_3d};
+            @group(1) @binding(2) var vol: texture_2d<f32>;
+            /// @pass(target = "vol", width = 8, height = 8, depth = 8)
+            @compute @workgroup_size(4, 4, 4)
+            fn bake() {{}}
+            {FINAL_PASS}
+            "#
+        );
+        assert!(matches!(
+            schema_err(&read_as_2d),
+            SchemaError::TargetDimension { expected, .. } if expected == "texture_3d<f32>"
+        ));
+    }
+
+    #[test]
     fn pass_errors() {
         assert!(matches!(
             schema_err(
@@ -1653,6 +1870,9 @@ mod tests {
         assert_eq!(eval_size("$WIDTH/16.0", base).unwrap(), 50);
         assert_eq!(eval_size("512", base).unwrap(), 512);
         assert_eq!(eval_size("max($HEIGHT, 1024)", base).unwrap(), 1024);
+        assert_eq!(eval_size("$DEPTH", base).unwrap(), 1);
+        let volume = UVec3::new(128, 64, 32);
+        assert_eq!(eval_size_3d("$DEPTH/4", volume).unwrap(), 8);
         assert!(matches!(
             eval_size("0", base),
             Err(SizeExprError::NonPositive { .. })
